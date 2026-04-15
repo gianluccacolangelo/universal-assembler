@@ -43,6 +43,8 @@ if [ -n "$ultimate_subdir" ]; then
     file_path=""
     if [ -f "${ultimate_subdir}Video.mkv" ]; then
         file_path="${ultimate_subdir}Video.mkv"
+    elif [ -f "${ultimate_subdir}Video.mov" ]; then
+        file_path="${ultimate_subdir}Video.mov"
     elif [ -f "${ultimate_subdir}Video.mp4" ]; then
         file_path="${ultimate_subdir}Video.mp4"
     fi

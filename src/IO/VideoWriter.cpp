@@ -80,23 +80,38 @@ bool VideoWriter::encode_and_write_frame(AVFrame* frame){
     return true;
 }
 
-VideoWriter::VideoWriter(AVFormatContext *fc_, const string& video_path, int video_width_pixels_, int video_height_pixels_, int video_framerate_fps_)
+VideoWriter::VideoWriter(
+    AVFormatContext *fc_,
+    const string& video_path,
+    int video_width_pixels_,
+    int video_height_pixels_,
+    int video_framerate_fps_,
+    bool encode_alpha_
+)
     : fc(fc_),
       video_width_pixels(video_width_pixels_),
       video_height_pixels(video_height_pixels_),
-      video_framerate_fps(video_framerate_fps_) {
+      video_framerate_fps(video_framerate_fps_),
+      encode_alpha(encode_alpha_) {
     av_log_set_level(AV_LOG_DEBUG);
 
     // Setting up the codec.
-    const AVCodec* codec = avcodec_find_encoder_by_name("libx264");
+    const char* codec_name = encode_alpha ? "prores_ks" : "libx264";
+    const AVCodec* codec = avcodec_find_encoder_by_name(codec_name);
     if (!codec) {
-        throw runtime_error("Failed to find video codec");
+        throw runtime_error("Failed to find video codec: " + string(codec_name));
     }
 
     AVDictionary* opt = NULL;
-    av_dict_set(&opt, "preset", "medium", 0);
-    av_dict_set(&opt, "tune", "film", 0);
-    av_dict_set(&opt, "crf", "18", 0);
+    if (encode_alpha) {
+        av_dict_set(&opt, "profile", "4444", 0);
+        av_dict_set(&opt, "alpha_bits", "16", 0);
+        av_dict_set(&opt, "vendor", "apl0", 0);
+    } else {
+        av_dict_set(&opt, "preset", "medium", 0);
+        av_dict_set(&opt, "tune", "film", 0);
+        av_dict_set(&opt, "crf", "18", 0);
+    }
 
     videoStream = avformat_new_stream(fc, codec);
     if (!videoStream) {
@@ -109,7 +124,7 @@ VideoWriter::VideoWriter(AVFormatContext *fc_, const string& video_path, int vid
     }
     videoCodecContext->width = video_width_pixels;
     videoCodecContext->height = video_height_pixels;
-    videoCodecContext->pix_fmt = AV_PIX_FMT_YUV420P10LE;
+    videoCodecContext->pix_fmt = encode_alpha ? AV_PIX_FMT_YUVA444P10LE : AV_PIX_FMT_YUV420P10LE;
     videoCodecContext->time_base = videoStream->time_base = { 1, video_framerate_fps };
     videoCodecContext->color_range = AVCOL_RANGE_JPEG;
     videoCodecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -159,7 +174,9 @@ void VideoWriter::add_frame(Pixels& p) {
         throw runtime_error("Frame dimensions were expected to be (" + to_string(video_width_pixels) + ", " + to_string(video_height_pixels) + "), but they were instead (" + to_string(p.w) + ", " + to_string(p.h) + ")!");
 
     #ifdef USE_GPU
+    if (!encode_alpha) {
     alpha_overlay_cuda(reinterpret_cast<unsigned int*>(p.pixels.data()), video_width_pixels, video_height_pixels, get_video_background_color());
+    }
     #endif
 
     bool fifth_frame = int(get_global_state("frame_number")) % 5 == 0;

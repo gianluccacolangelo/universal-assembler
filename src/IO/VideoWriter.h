@@ -24,6 +24,7 @@ private:
     int video_width_pixels = 0;
     int video_height_pixels = 0;
     int video_framerate_fps = 0;
+    bool encode_alpha = false;
 
     AVStream *videoStream = nullptr;
     AVCodecContext *videoCodecContext = nullptr;
@@ -35,7 +36,7 @@ private:
     bool encode_and_write_frame(AVFrame* frame);
 
 public:
-    VideoWriter(AVFormatContext *fc_, const std::string& video_path, int video_width_pixels, int video_height_pixels, int video_framerate_fps);
+    VideoWriter(AVFormatContext *fc_, const std::string& video_path, int video_width_pixels, int video_height_pixels, int video_framerate_fps, bool encode_alpha);
     void add_frame(Pixels& p);
     ~VideoWriter();
 };

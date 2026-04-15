@@ -8,8 +8,22 @@
 #include "AudioWriter.h"
 #include "VideoWriter.h"
 #include "../Core/Smoketest.h"
+#include <cstdlib>
 
 using namespace std;
+
+namespace {
+
+bool transparent_mov_enabled() {
+    const char* value = std::getenv("SWAPTUBE_TRANSPARENT_MOV");
+    return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+string video_output_path() {
+    return transparent_mov_enabled() ? "io_out/Video.mov" : "io_out/Video.mkv";
+}
+
+}
 
 Writer::Writer(int video_width_pixels, int video_height_pixels, int video_framerate_fps, int audio_samplerate_hz, uint32_t video_background_color) :
     video_width_pixels(video_width_pixels),
@@ -22,13 +36,20 @@ Writer::Writer(int video_width_pixels, int video_height_pixels, int video_framer
     subtitle = new SubtitleWriter();
 
     if (is_smoketest()) return;
-    const std::string video_path = "io_out/Video.mkv";
+    const std::string video_path = video_output_path();
     int ret = avformat_alloc_output_context2(&format_context, NULL, NULL, video_path.c_str());
     if (ret < 0) throw std::runtime_error("Failed to allocate output format context");
     if (format_context == nullptr) throw std::runtime_error("Failed to allocate output format context");
 
     audio = new AudioWriter(format_context, audio_samplerate_hz, video_framerate_fps);
-    video = new VideoWriter(format_context, video_path, video_width_pixels, video_height_pixels, video_framerate_fps);
+    video = new VideoWriter(
+        format_context,
+        video_path,
+        video_width_pixels,
+        video_height_pixels,
+        video_framerate_fps,
+        transparent_mov_enabled()
+    );
 }
 
 Writer::~Writer() {

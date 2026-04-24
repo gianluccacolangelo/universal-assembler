@@ -78,6 +78,25 @@ The browsing model is preset-first:
 - shortlist patches by scene role such as `Pads`, `Leads`, `Plucks`, `FX`, or `Sequences`
 - map scene state into macros, mod wheel, aftertouch, pitch bend, and note choice before reaching for lower-level parameter surgery
 
+The same wrapper can process existing audio with one Surge effect and block-rate parameter automation:
+
+```cpp
+SurgeXTEffect reverb(get_audio_samplerate_hz(), "Reverb 2");
+reverb
+    .set_parameter_01("Mix", 0.45f)
+    .automate_parameter_value("Room Size", [](const SurgeXTEffectContext& context) {
+        const double circle_radius = 0.15 + 0.85 * context.progress_01;
+        return cos(2.0 * M_PI * circle_radius);
+    });
+
+SurgeXTEffectRenderOptions options;
+options.start_sample = get_audio_samplerate_hz();
+options.num_samples = 4 * get_audio_samplerate_hz();
+reverb.process(left, right, options);
+```
+
+`SurgeEffectAutomationDemo` is a minimal project showing this workflow. `list_effect_types()` lists available effects, and `list_parameters()` prints the names to use with `set_parameter_*()` and `automate_parameter_*()`.
+
 ## Docker Setup
 For easy deployment with all dependencies included, see the [docker/README.md](docker/README.md) for containerized setup instructions. This is optional and community-made for Docker users. I (2swap) personally don't use or maintain it.
 

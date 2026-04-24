@@ -2,6 +2,8 @@
 
 #include "AudioWriter.h"
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -59,6 +61,52 @@ struct SurgeXTModulationSourceInfo {
     bool is_voice_modulator = false;
 };
 
+struct SurgeXTEffectTypeInfo {
+    int id = -1;
+    std::string name;
+    bool supported = false;
+};
+
+struct SurgeXTEffectParameterInfo {
+    int index = -1;
+    int storage_index = -1;
+    std::string name;
+    std::string group;
+    int control_type = 0;
+    int value_type = 0;
+    bool modulateable = false;
+    bool is_bipolar = false;
+    bool is_discrete = false;
+    bool can_temposync = false;
+    bool can_extend_range = false;
+    bool can_deactivate = false;
+    bool enabled = false;
+    float normalized_value = 0.0f;
+    float default_normalized_value = 0.0f;
+    double value = 0.0;
+    double min_value = 0.0;
+    double max_value = 0.0;
+    double default_value = 0.0;
+    std::string display;
+};
+
+struct SurgeXTEffectContext {
+    int64_t sample_index = 0;
+    int64_t relative_sample_index = 0;
+    double time_seconds = 0.0;
+    double relative_time_seconds = 0.0;
+    double progress_01 = 0.0;
+};
+
+struct SurgeXTEffectRenderOptions {
+    int64_t start_sample = 0;
+    int64_t num_samples = -1;
+    double tail_seconds = 2.0;
+    bool add_tail = true;
+};
+
+using SurgeXTEffectValueFn = std::function<float(const SurgeXTEffectContext&)>;
+
 enum class SurgeXTModulationSource {
     AmpEnvelope,
     FilterEnvelope,
@@ -74,6 +122,77 @@ enum class SurgeXTModulationSource {
     SceneLFO4,
     SceneLFO5,
     SceneLFO6,
+};
+
+class SurgeXTEffect {
+public:
+    explicit SurgeXTEffect(int sample_rate_hz, const std::string& effect_name);
+    explicit SurgeXTEffect(int sample_rate_hz, int effect_type_id);
+    ~SurgeXTEffect();
+
+    SurgeXTEffect(const SurgeXTEffect&) = delete;
+    SurgeXTEffect& operator=(const SurgeXTEffect&) = delete;
+    SurgeXTEffect(SurgeXTEffect&&) noexcept;
+    SurgeXTEffect& operator=(SurgeXTEffect&&) noexcept;
+
+    static bool available();
+    static std::string availability_message();
+    static std::vector<SurgeXTEffectTypeInfo> list_effect_types();
+    static std::optional<int> effect_type_id_for_name(const std::string& effect_name);
+
+    int effect_type_id() const;
+    std::string effect_name() const;
+
+    std::vector<SurgeXTEffectParameterInfo> list_parameters() const;
+    std::optional<SurgeXTEffectParameterInfo> get_parameter_info(int parameter_index) const;
+    std::optional<SurgeXTEffectParameterInfo> get_parameter_info(const std::string& parameter_name) const;
+    int parameter_index(const std::string& parameter_name) const;
+
+    SurgeXTEffect& set_parameter_01(int parameter_index, float normalized_01, bool force_integer = false);
+    SurgeXTEffect& set_parameter_01(const std::string& parameter_name,
+                                    float normalized_01,
+                                    bool force_integer = false);
+    SurgeXTEffect& set_parameter_value(int parameter_index, float value, bool force_integer = false);
+    SurgeXTEffect& set_parameter_value(const std::string& parameter_name,
+                                       float value,
+                                       bool force_integer = false);
+    bool set_parameter_from_string(const std::string& parameter_name,
+                                   const std::string& value,
+                                   std::string& error_message);
+
+    SurgeXTEffect& automate_parameter_01(const std::string& parameter_name,
+                                         SurgeXTEffectValueFn value_fn,
+                                         bool force_integer = false);
+    SurgeXTEffect& automate_parameter_value(const std::string& parameter_name,
+                                            SurgeXTEffectValueFn value_fn,
+                                            bool force_integer = false);
+    SurgeXTEffect& clear_automations();
+    SurgeXTEffect& clear_automation(const std::string& parameter_name);
+
+    float get_parameter_01(const std::string& parameter_name) const;
+    float normalized_to_value(const std::string& parameter_name, float normalized_01) const;
+    float value_to_normalized(const std::string& parameter_name, float value) const;
+    std::string get_parameter_display(const std::string& parameter_name) const;
+    std::string get_parameter_display_for_normalized(const std::string& parameter_name,
+                                                     float normalized_01) const;
+
+    void process(std::vector<sample_t>& left,
+                 std::vector<sample_t>& right,
+                 const SurgeXTEffectRenderOptions& options = {});
+    void process_from_sample(std::vector<sample_t>& left,
+                             std::vector<sample_t>& right,
+                             int64_t start_sample);
+    void process_from_seconds(std::vector<sample_t>& left,
+                              std::vector<sample_t>& right,
+                              double start_seconds);
+    void process_from_frame(std::vector<sample_t>& left,
+                            std::vector<sample_t>& right,
+                            int64_t start_frame,
+                            int video_framerate_fps);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
 };
 
 class SurgeXT {

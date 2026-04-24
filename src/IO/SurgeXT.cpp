@@ -1,6 +1,7 @@
 #include "SurgeXT.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -8,6 +9,7 @@
 #include <utility>
 
 #ifdef SWAPTUBE_USE_SURGE_XT
+#include "Effect.h"
 #include "ModulationSource.h"
 #include "SurgeSynthesizer.h"
 #include "SurgeStorage.h"
@@ -30,6 +32,17 @@ string lowercase_copy(string value) {
     std::transform(value.begin(), value.end(), value.begin(),
                    [](const unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return value;
+}
+
+string lookup_key_copy(const string& value) {
+    string key;
+    key.reserve(value.size());
+    for (const unsigned char ch : value) {
+        if (std::isalnum(ch)) {
+            key.push_back(static_cast<char>(std::tolower(ch)));
+        }
+    }
+    return key;
 }
 
 void require_range(const int index, const int count, const char* label) {
@@ -55,6 +68,53 @@ double numeric_value_from_parameter(const Parameter& parameter, const pdata& val
 modsources require_mod_source_id(const int source_id) {
     require_range(source_id, n_modsources, "modulation source id");
     return static_cast<modsources>(source_id);
+}
+
+bool is_supported_effect_type_id(const int effect_type_id) {
+    return effect_type_id > fxt_off &&
+           effect_type_id < n_fx_types &&
+           effect_type_id != fxt_audio_input &&
+           effect_type_id != fxt_convolution;
+}
+
+int require_supported_effect_type_id(const int effect_type_id) {
+    if (!is_supported_effect_type_id(effect_type_id)) {
+        throw runtime_error("Unsupported Surge XT effect type id: " + to_string(effect_type_id));
+    }
+    return effect_type_id;
+}
+
+int effect_type_id_for_name_or_throw(const string& effect_name) {
+    const string requested_key = lookup_key_copy(effect_name);
+    if (requested_key.empty()) {
+        throw runtime_error("Surge XT effect name is empty.");
+    }
+
+    for (int i = fxt_off + 1; i < n_fx_types; ++i) {
+        if (!is_supported_effect_type_id(i)) {
+            continue;
+        }
+        const string candidate = fx_type_names[i] ? fx_type_names[i] : "";
+        if (lookup_key_copy(candidate) == requested_key) {
+            return i;
+        }
+    }
+
+    for (int i = fxt_off + 1; i < n_fx_types; ++i) {
+        if (!is_supported_effect_type_id(i)) {
+            continue;
+        }
+        const string candidate = fx_type_names[i] ? fx_type_names[i] : "";
+        if (lookup_key_copy(candidate).find(requested_key) != string::npos) {
+            return i;
+        }
+    }
+
+    throw runtime_error("Unknown Surge XT effect: " + effect_name);
+}
+
+void copy_patch_globaldata(SurgeStorage& storage) {
+    storage.getPatch().copy_globaldata(storage.getPatch().globaldata);
 }
 #endif
 
@@ -95,6 +155,763 @@ modsources to_surge_mod_source(const SurgeXTModulationSource source) {
 }
 #endif
 
+}
+
+struct SurgeXTEffect::Impl {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    enum class AutomationUnit {
+        Normalized01,
+        NativeValue,
+    };
+
+    struct Automation {
+        int storage_index = -1;
+        SurgeXTEffectValueFn value_fn;
+        AutomationUnit unit = AutomationUnit::Normalized01;
+        bool force_integer = false;
+    };
+
+    unique_ptr<SurgeStorage> storage;
+    FxStorage* fxstorage = nullptr;
+    unique_ptr<Effect> effect;
+    int sample_rate_hz = 48000;
+    int current_effect_type_id = fxt_off;
+    vector<int> parameter_order;
+    vector<Automation> automations;
+
+    Impl(const int sample_rate_hz_, const int effect_type_id)
+        : sample_rate_hz(sample_rate_hz_) {
+        if (sample_rate_hz <= 0) {
+            throw runtime_error("Surge XT effect sample rate must be positive.");
+        }
+
+        auto config = SurgeStorage::SurgeStorageConfig::fromDataPath(SWAPTUBE_SURGE_XT_DATA_DIR);
+        config.createUserDirectory = false;
+        config.scanWavetableAndPatches = false;
+        storage = make_unique<SurgeStorage>(config);
+        storage->setSamplerate(static_cast<float>(sample_rate_hz));
+        storage->temposyncratio = 1.0f;
+        storage->temposyncratio_inv = 1.0f;
+        storage->songpos = 0.0;
+
+        fxstorage = &storage->getPatch().fx[0];
+        fxstorage->return_level.id = -1;
+        reset_effect(effect_type_id);
+    }
+
+    const char* effect_name_c_str() const {
+        if (current_effect_type_id > fxt_off && current_effect_type_id < n_fx_types) {
+            return fx_type_names[current_effect_type_id];
+        }
+        return "";
+    }
+
+    void reset_effect(const int effect_type_id) {
+        current_effect_type_id = require_supported_effect_type_id(effect_type_id);
+        fxstorage->type.val.i = current_effect_type_id;
+        for (int i = 0; i < n_fx_params; ++i) {
+            fxstorage->p[i].set_type(ct_none);
+        }
+
+        effect.reset(spawn_effect(current_effect_type_id, storage.get(), fxstorage,
+                                  storage->getPatch().globaldata));
+        if (!effect) {
+            throw runtime_error("Surge XT could not create effect: " + string(effect_name_c_str()));
+        }
+
+        effect->init();
+        effect->init_ctrltypes();
+        effect->init_default_values();
+        effect->sampleRateReset();
+        rebuild_parameter_order();
+        copy_patch_globaldata(*storage);
+    }
+
+    void rebuild_parameter_order() {
+        vector<pair<int, int>> ordered;
+        ordered.reserve(n_fx_params);
+        for (int i = 0; i < n_fx_params; ++i) {
+            const auto& parameter = fxstorage->p[i];
+            if (parameter.ctrltype == ct_none) {
+                continue;
+            }
+
+            const int sort_key =
+                parameter.posy_offset ? i * 2 + parameter.posy_offset : 10000 + i;
+            ordered.push_back({i, sort_key});
+        }
+
+        sort(ordered.begin(), ordered.end(),
+             [](const pair<int, int>& left, const pair<int, int>& right) {
+                 return left.second < right.second;
+             });
+
+        parameter_order.clear();
+        parameter_order.reserve(ordered.size());
+        for (const auto& item : ordered) {
+            parameter_order.push_back(item.first);
+        }
+    }
+
+    int require_display_parameter_index(const int parameter_index) const {
+        if (parameter_index < 0 || parameter_index >= static_cast<int>(parameter_order.size())) {
+            throw runtime_error("Surge XT effect parameter index is out of range.");
+        }
+        return parameter_order[static_cast<size_t>(parameter_index)];
+    }
+
+    optional<int> storage_index_for_name(const string& parameter_name) const {
+        const string requested_key = lookup_key_copy(parameter_name);
+        if (requested_key.empty()) {
+            return nullopt;
+        }
+
+        for (const int storage_index : parameter_order) {
+            const string name_key = lookup_key_copy(fxstorage->p[storage_index].get_name());
+            if (name_key == requested_key) {
+                return storage_index;
+            }
+        }
+
+        for (const int storage_index : parameter_order) {
+            const string name_key = lookup_key_copy(fxstorage->p[storage_index].get_name());
+            if (name_key.find(requested_key) != string::npos) {
+                return storage_index;
+            }
+        }
+
+        return nullopt;
+    }
+
+    int require_storage_index_for_name(const string& parameter_name) const {
+        const optional<int> storage_index = storage_index_for_name(parameter_name);
+        if (!storage_index) {
+            throw runtime_error("Unknown Surge XT effect parameter: " + parameter_name);
+        }
+        return *storage_index;
+    }
+
+    string group_name_for_storage_index(const int storage_index) const {
+        if (!effect) {
+            return "";
+        }
+
+        const auto& parameter = fxstorage->p[storage_index];
+        const int fpos = parameter.posy / 10 + parameter.posy_offset;
+        string group;
+        for (int i = 0; i < n_fx_params && effect->group_label(i); ++i) {
+            if (effect->group_label_ypos(i) <= fpos) {
+                group = effect->group_label(i);
+            }
+        }
+        return group;
+    }
+
+    SurgeXTEffectParameterInfo parameter_info(const int display_index,
+                                              const int storage_index) const {
+        const auto& parameter = fxstorage->p[storage_index];
+
+        SurgeXTEffectParameterInfo info;
+        info.index = display_index;
+        info.storage_index = storage_index;
+        info.name = parameter.get_name();
+        info.group = group_name_for_storage_index(storage_index);
+        info.control_type = parameter.ctrltype;
+        info.value_type = parameter.valtype;
+        info.modulateable = parameter.modulateable;
+        info.is_bipolar = parameter.is_bipolar();
+        info.is_discrete = parameter.is_discrete_selection();
+        info.can_temposync = parameter.can_temposync();
+        info.can_extend_range = parameter.can_extend_range();
+        info.can_deactivate = parameter.can_deactivate();
+        info.enabled = parameter.ctrltype != ct_none;
+        info.normalized_value = parameter.get_value_f01();
+        info.default_normalized_value = parameter.get_default_value_f01();
+        info.value = numeric_value_from_parameter(parameter, parameter.val);
+        info.min_value = numeric_value_from_parameter(parameter, parameter.val_min);
+        info.max_value = numeric_value_from_parameter(parameter, parameter.val_max);
+        info.default_value = numeric_value_from_parameter(parameter, parameter.val_default);
+        info.display = parameter.get_display();
+        return info;
+    }
+
+    vector<SurgeXTEffectParameterInfo> list_parameters() const {
+        vector<SurgeXTEffectParameterInfo> parameters;
+        parameters.reserve(parameter_order.size());
+        for (size_t i = 0; i < parameter_order.size(); ++i) {
+            parameters.push_back(parameter_info(static_cast<int>(i), parameter_order[i]));
+        }
+        return parameters;
+    }
+
+    void set_parameter_01_storage(const int storage_index,
+                                  const float normalized_01,
+                                  const bool force_integer,
+                                  const bool copy_globaldata_after = true) {
+        require_range(storage_index, n_fx_params, "effect parameter storage index");
+        fxstorage->p[storage_index].set_value_f01(clamp01(normalized_01), force_integer);
+        if (copy_globaldata_after) {
+            copy_patch_globaldata(*storage);
+        }
+    }
+
+    void set_parameter_value_storage(const int storage_index,
+                                     const float value,
+                                     const bool force_integer,
+                                     const bool copy_globaldata_after = true) {
+        require_range(storage_index, n_fx_params, "effect parameter storage index");
+        const float normalized_01 = fxstorage->p[storage_index].value_to_normalized(value);
+        set_parameter_01_storage(storage_index, normalized_01, force_integer,
+                                 copy_globaldata_after);
+    }
+
+    void replace_automation(const int storage_index,
+                            SurgeXTEffectValueFn value_fn,
+                            const AutomationUnit unit,
+                            const bool force_integer) {
+        if (!value_fn) {
+            throw runtime_error("Surge XT effect automation requires a value function.");
+        }
+
+        automations.erase(remove_if(automations.begin(), automations.end(),
+                                    [storage_index](const Automation& automation) {
+                                        return automation.storage_index == storage_index;
+                                    }),
+                          automations.end());
+        automations.push_back({storage_index, std::move(value_fn), unit, force_integer});
+    }
+
+    SurgeXTEffectContext context_for(const int64_t sample_index,
+                                     const int64_t start_sample,
+                                     const int64_t active_sample_count) const {
+        SurgeXTEffectContext context;
+        context.sample_index = sample_index;
+        context.relative_sample_index = max<int64_t>(0, sample_index - start_sample);
+        context.time_seconds = static_cast<double>(sample_index) / sample_rate_hz;
+        context.relative_time_seconds =
+            static_cast<double>(context.relative_sample_index) / sample_rate_hz;
+        if (active_sample_count > 1) {
+            context.progress_01 =
+                static_cast<double>(context.relative_sample_index) /
+                static_cast<double>(active_sample_count - 1);
+            context.progress_01 = max(0.0, min(1.0, context.progress_01));
+        }
+        return context;
+    }
+
+    void apply_automations(const SurgeXTEffectContext& context) {
+        if (automations.empty()) {
+            return;
+        }
+
+        for (const auto& automation : automations) {
+            const float value = automation.value_fn(context);
+            if (!std::isfinite(value)) {
+                throw runtime_error("Surge XT effect automation returned a non-finite value.");
+            }
+
+            if (automation.unit == AutomationUnit::NativeValue) {
+                set_parameter_value_storage(automation.storage_index, value,
+                                            automation.force_integer, false);
+            } else {
+                set_parameter_01_storage(automation.storage_index, value,
+                                         automation.force_integer, false);
+            }
+        }
+        copy_patch_globaldata(*storage);
+    }
+
+    void process(vector<sample_t>& left,
+                 vector<sample_t>& right,
+                 const SurgeXTEffectRenderOptions& options) {
+        if (left.size() != right.size()) {
+            throw runtime_error("Surge XT effect processing requires equal left/right lengths.");
+        }
+        if (!effect) {
+            throw runtime_error("Surge XT effect is not initialized.");
+        }
+
+        const int64_t total_samples = static_cast<int64_t>(left.size());
+        if (total_samples == 0) {
+            return;
+        }
+
+        const int64_t start_sample = max<int64_t>(0, options.start_sample);
+        if (start_sample >= total_samples) {
+            return;
+        }
+
+        const int64_t requested_count =
+            options.num_samples < 0 ? total_samples - start_sample : options.num_samples;
+        if (requested_count <= 0) {
+            return;
+        }
+
+        const int64_t active_sample_count =
+            min<int64_t>(requested_count, total_samples - start_sample);
+        const int64_t active_end = start_sample + active_sample_count;
+        const int64_t tail_blocks =
+            options.add_tail && options.tail_seconds > 0.0
+                ? static_cast<int64_t>(ceil(options.tail_seconds * sample_rate_hz / BLOCK_SIZE))
+                : 0;
+
+        array<float, BLOCK_SIZE> block_left{};
+        array<float, BLOCK_SIZE> block_right{};
+        int64_t cursor = start_sample;
+
+        while (cursor < active_end) {
+            fill(block_left.begin(), block_left.end(), 0.0f);
+            fill(block_right.begin(), block_right.end(), 0.0f);
+
+            for (int i = 0; i < BLOCK_SIZE; ++i) {
+                const int64_t sample_index = cursor + i;
+                if (sample_index >= active_end || sample_index >= total_samples) {
+                    break;
+                }
+                block_left[i] = sample_to_float(left[static_cast<size_t>(sample_index)]);
+                block_right[i] = sample_to_float(right[static_cast<size_t>(sample_index)]);
+            }
+
+            const SurgeXTEffectContext context =
+                context_for(cursor, start_sample, active_sample_count);
+            storage->songpos = context.time_seconds;
+            apply_automations(context);
+            effect->process_ringout(block_left.data(), block_right.data(), true);
+
+            for (int i = 0; i < BLOCK_SIZE; ++i) {
+                const int64_t sample_index = cursor + i;
+                if (sample_index >= total_samples) {
+                    break;
+                }
+
+                if (sample_index < active_end) {
+                    left[static_cast<size_t>(sample_index)] = float_to_sample(block_left[i]);
+                    right[static_cast<size_t>(sample_index)] = float_to_sample(block_right[i]);
+                } else if (options.add_tail) {
+                    const float mixed_left =
+                        sample_to_float(left[static_cast<size_t>(sample_index)]) + block_left[i];
+                    const float mixed_right =
+                        sample_to_float(right[static_cast<size_t>(sample_index)]) + block_right[i];
+                    left[static_cast<size_t>(sample_index)] = float_to_sample(mixed_left);
+                    right[static_cast<size_t>(sample_index)] = float_to_sample(mixed_right);
+                }
+            }
+
+            cursor += BLOCK_SIZE;
+        }
+
+        for (int64_t tail_block = 0;
+             tail_block < tail_blocks && cursor < total_samples;
+             ++tail_block, cursor += BLOCK_SIZE) {
+            fill(block_left.begin(), block_left.end(), 0.0f);
+            fill(block_right.begin(), block_right.end(), 0.0f);
+
+            storage->songpos = static_cast<double>(cursor) / sample_rate_hz;
+            const bool has_output =
+                effect->process_ringout(block_left.data(), block_right.data(), false);
+            if (!has_output) {
+                break;
+            }
+
+            for (int i = 0; i < BLOCK_SIZE; ++i) {
+                const int64_t sample_index = cursor + i;
+                if (sample_index >= total_samples) {
+                    break;
+                }
+                const float mixed_left =
+                    sample_to_float(left[static_cast<size_t>(sample_index)]) + block_left[i];
+                const float mixed_right =
+                    sample_to_float(right[static_cast<size_t>(sample_index)]) + block_right[i];
+                left[static_cast<size_t>(sample_index)] = float_to_sample(mixed_left);
+                right[static_cast<size_t>(sample_index)] = float_to_sample(mixed_right);
+            }
+        }
+    }
+#else
+    explicit Impl(const int, const int) {
+        throw runtime_error(SurgeXTEffect::availability_message());
+    }
+#endif
+};
+
+SurgeXTEffect::SurgeXTEffect(const int sample_rate_hz, const string& effect_name)
+    : SurgeXTEffect(sample_rate_hz,
+#ifdef SWAPTUBE_USE_SURGE_XT
+                    effect_type_id_for_name_or_throw(effect_name)
+#else
+                    -1
+#endif
+                    ) {
+#ifndef SWAPTUBE_USE_SURGE_XT
+    (void)effect_name;
+#endif
+}
+
+SurgeXTEffect::SurgeXTEffect(const int sample_rate_hz, const int effect_type_id)
+    : impl(make_unique<Impl>(sample_rate_hz, effect_type_id)) {}
+SurgeXTEffect::~SurgeXTEffect() = default;
+SurgeXTEffect::SurgeXTEffect(SurgeXTEffect&&) noexcept = default;
+SurgeXTEffect& SurgeXTEffect::operator=(SurgeXTEffect&&) noexcept = default;
+
+bool SurgeXTEffect::available() {
+    return SurgeXT::available();
+}
+
+string SurgeXTEffect::availability_message() {
+    return SurgeXT::availability_message();
+}
+
+vector<SurgeXTEffectTypeInfo> SurgeXTEffect::list_effect_types() {
+    vector<SurgeXTEffectTypeInfo> effects;
+#ifdef SWAPTUBE_USE_SURGE_XT
+    effects.reserve(n_fx_types - 1);
+    for (int i = fxt_off + 1; i < n_fx_types; ++i) {
+        effects.push_back({
+            i,
+            fx_type_names[i] ? fx_type_names[i] : "",
+            is_supported_effect_type_id(i),
+        });
+    }
+#endif
+    return effects;
+}
+
+optional<int> SurgeXTEffect::effect_type_id_for_name(const string& effect_name) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    try {
+        return effect_type_id_for_name_or_throw(effect_name);
+    } catch (const runtime_error&) {
+        return nullopt;
+    }
+#else
+    (void)effect_name;
+    return nullopt;
+#endif
+}
+
+int SurgeXTEffect::effect_type_id() const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    return impl->current_effect_type_id;
+#else
+    throw runtime_error(availability_message());
+#endif
+}
+
+string SurgeXTEffect::effect_name() const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    return impl->effect_name_c_str();
+#else
+    throw runtime_error(availability_message());
+#endif
+}
+
+vector<SurgeXTEffectParameterInfo> SurgeXTEffect::list_parameters() const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    return impl->list_parameters();
+#else
+    return {};
+#endif
+}
+
+optional<SurgeXTEffectParameterInfo> SurgeXTEffect::get_parameter_info(
+    const int parameter_index) const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    if (parameter_index < 0 || parameter_index >= static_cast<int>(impl->parameter_order.size())) {
+        return nullopt;
+    }
+    return impl->parameter_info(parameter_index, impl->parameter_order[parameter_index]);
+#else
+    (void)parameter_index;
+    return nullopt;
+#endif
+}
+
+optional<SurgeXTEffectParameterInfo> SurgeXTEffect::get_parameter_info(
+    const string& parameter_name) const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    const optional<int> storage_index = impl->storage_index_for_name(parameter_name);
+    if (!storage_index) {
+        return nullopt;
+    }
+    for (size_t i = 0; i < impl->parameter_order.size(); ++i) {
+        if (impl->parameter_order[i] == *storage_index) {
+            return impl->parameter_info(static_cast<int>(i), *storage_index);
+        }
+    }
+    return nullopt;
+#else
+    (void)parameter_name;
+    return nullopt;
+#endif
+}
+
+int SurgeXTEffect::parameter_index(const string& parameter_name) const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    const optional<int> storage_index = impl->storage_index_for_name(parameter_name);
+    if (!storage_index) {
+        return -1;
+    }
+    for (size_t i = 0; i < impl->parameter_order.size(); ++i) {
+        if (impl->parameter_order[i] == *storage_index) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+#else
+    (void)parameter_name;
+    return -1;
+#endif
+}
+
+SurgeXTEffect& SurgeXTEffect::set_parameter_01(const int parameter_index,
+                                               const float normalized_01,
+                                               const bool force_integer) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    impl->set_parameter_01_storage(impl->require_display_parameter_index(parameter_index),
+                                   normalized_01, force_integer);
+    return *this;
+#else
+    (void)parameter_index;
+    (void)normalized_01;
+    (void)force_integer;
+    throw runtime_error(availability_message());
+#endif
+}
+
+SurgeXTEffect& SurgeXTEffect::set_parameter_01(const string& parameter_name,
+                                               const float normalized_01,
+                                               const bool force_integer) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    impl->set_parameter_01_storage(impl->require_storage_index_for_name(parameter_name),
+                                   normalized_01, force_integer);
+    return *this;
+#else
+    (void)parameter_name;
+    (void)normalized_01;
+    (void)force_integer;
+    throw runtime_error(availability_message());
+#endif
+}
+
+SurgeXTEffect& SurgeXTEffect::set_parameter_value(const int parameter_index,
+                                                  const float value,
+                                                  const bool force_integer) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    impl->set_parameter_value_storage(impl->require_display_parameter_index(parameter_index),
+                                      value, force_integer);
+    return *this;
+#else
+    (void)parameter_index;
+    (void)value;
+    (void)force_integer;
+    throw runtime_error(availability_message());
+#endif
+}
+
+SurgeXTEffect& SurgeXTEffect::set_parameter_value(const string& parameter_name,
+                                                  const float value,
+                                                  const bool force_integer) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    impl->set_parameter_value_storage(impl->require_storage_index_for_name(parameter_name),
+                                      value, force_integer);
+    return *this;
+#else
+    (void)parameter_name;
+    (void)value;
+    (void)force_integer;
+    throw runtime_error(availability_message());
+#endif
+}
+
+bool SurgeXTEffect::set_parameter_from_string(const string& parameter_name,
+                                              const string& value,
+                                              string& error_message) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    const int storage_index = impl->require_storage_index_for_name(parameter_name);
+    if (!impl->fxstorage->p[storage_index].set_value_from_string(value, error_message)) {
+        return false;
+    }
+    copy_patch_globaldata(*impl->storage);
+    return true;
+#else
+    (void)parameter_name;
+    (void)value;
+    error_message = availability_message();
+    throw runtime_error(availability_message());
+#endif
+}
+
+SurgeXTEffect& SurgeXTEffect::automate_parameter_01(const string& parameter_name,
+                                                    SurgeXTEffectValueFn value_fn,
+                                                    const bool force_integer) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    impl->replace_automation(impl->require_storage_index_for_name(parameter_name),
+                             std::move(value_fn), Impl::AutomationUnit::Normalized01,
+                             force_integer);
+    return *this;
+#else
+    (void)parameter_name;
+    (void)value_fn;
+    (void)force_integer;
+    throw runtime_error(availability_message());
+#endif
+}
+
+SurgeXTEffect& SurgeXTEffect::automate_parameter_value(const string& parameter_name,
+                                                       SurgeXTEffectValueFn value_fn,
+                                                       const bool force_integer) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    impl->replace_automation(impl->require_storage_index_for_name(parameter_name),
+                             std::move(value_fn), Impl::AutomationUnit::NativeValue,
+                             force_integer);
+    return *this;
+#else
+    (void)parameter_name;
+    (void)value_fn;
+    (void)force_integer;
+    throw runtime_error(availability_message());
+#endif
+}
+
+SurgeXTEffect& SurgeXTEffect::clear_automations() {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    impl->automations.clear();
+    return *this;
+#else
+    throw runtime_error(availability_message());
+#endif
+}
+
+SurgeXTEffect& SurgeXTEffect::clear_automation(const string& parameter_name) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    const int storage_index = impl->require_storage_index_for_name(parameter_name);
+    impl->automations.erase(remove_if(impl->automations.begin(), impl->automations.end(),
+                                      [storage_index](const Impl::Automation& automation) {
+                                          return automation.storage_index == storage_index;
+                                      }),
+                            impl->automations.end());
+    return *this;
+#else
+    (void)parameter_name;
+    throw runtime_error(availability_message());
+#endif
+}
+
+float SurgeXTEffect::get_parameter_01(const string& parameter_name) const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    return impl->fxstorage->p[impl->require_storage_index_for_name(parameter_name)].get_value_f01();
+#else
+    (void)parameter_name;
+    throw runtime_error(availability_message());
+#endif
+}
+
+float SurgeXTEffect::normalized_to_value(const string& parameter_name,
+                                         const float normalized_01) const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    return impl->fxstorage->p[impl->require_storage_index_for_name(parameter_name)]
+        .normalized_to_value(clamp01(normalized_01));
+#else
+    (void)parameter_name;
+    (void)normalized_01;
+    throw runtime_error(availability_message());
+#endif
+}
+
+float SurgeXTEffect::value_to_normalized(const string& parameter_name, const float value) const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    return impl->fxstorage->p[impl->require_storage_index_for_name(parameter_name)]
+        .value_to_normalized(value);
+#else
+    (void)parameter_name;
+    (void)value;
+    throw runtime_error(availability_message());
+#endif
+}
+
+string SurgeXTEffect::get_parameter_display(const string& parameter_name) const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    return impl->fxstorage->p[impl->require_storage_index_for_name(parameter_name)].get_display();
+#else
+    (void)parameter_name;
+    throw runtime_error(availability_message());
+#endif
+}
+
+string SurgeXTEffect::get_parameter_display_for_normalized(const string& parameter_name,
+                                                           const float normalized_01) const {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    auto& parameter = impl->fxstorage->p[impl->require_storage_index_for_name(parameter_name)];
+    return parameter.get_display(true, parameter.normalized_to_value(clamp01(normalized_01)));
+#else
+    (void)parameter_name;
+    (void)normalized_01;
+    throw runtime_error(availability_message());
+#endif
+}
+
+void SurgeXTEffect::process(vector<sample_t>& left,
+                            vector<sample_t>& right,
+                            const SurgeXTEffectRenderOptions& options) {
+#ifdef SWAPTUBE_USE_SURGE_XT
+    impl->process(left, right, options);
+#else
+    (void)left;
+    (void)right;
+    (void)options;
+    throw runtime_error(availability_message());
+#endif
+}
+
+void SurgeXTEffect::process_from_sample(vector<sample_t>& left,
+                                        vector<sample_t>& right,
+                                        const int64_t start_sample) {
+    SurgeXTEffectRenderOptions options;
+    options.start_sample = start_sample;
+    process(left, right, options);
+}
+
+void SurgeXTEffect::process_from_seconds(vector<sample_t>& left,
+                                         vector<sample_t>& right,
+                                         const double start_seconds) {
+    if (start_seconds < 0.0) {
+        throw runtime_error("Surge XT effect start time must be non-negative.");
+    }
+#ifdef SWAPTUBE_USE_SURGE_XT
+    SurgeXTEffectRenderOptions options;
+    options.start_sample = static_cast<int64_t>(llround(start_seconds * impl->sample_rate_hz));
+    process(left, right, options);
+#else
+    (void)left;
+    (void)right;
+    (void)start_seconds;
+    throw runtime_error(availability_message());
+#endif
+}
+
+void SurgeXTEffect::process_from_frame(vector<sample_t>& left,
+                                       vector<sample_t>& right,
+                                       const int64_t start_frame,
+                                       const int video_framerate_fps) {
+    if (start_frame < 0) {
+        throw runtime_error("Surge XT effect start frame must be non-negative.");
+    }
+    if (video_framerate_fps <= 0) {
+        throw runtime_error("Surge XT effect video framerate must be positive.");
+    }
+#ifdef SWAPTUBE_USE_SURGE_XT
+    SurgeXTEffectRenderOptions options;
+    options.start_sample =
+        static_cast<int64_t>(llround(static_cast<double>(start_frame) *
+                                     impl->sample_rate_hz / video_framerate_fps));
+    process(left, right, options);
+#else
+    (void)left;
+    (void)right;
+    (void)start_frame;
+    (void)video_framerate_fps;
+    throw runtime_error(availability_message());
+#endif
 }
 
 struct SurgeXT::Impl {

@@ -42,7 +42,7 @@ check_command_available "pkg-config"
 JOB_COUNT=$(get_job_count)
 CMAKE_GENERATOR=$(pick_cmake_generator)
 REPO_ROOT=$(pwd)
-SURGE_XT_ENABLED=${SWAPTUBE_ENABLE_SURGE_XT:-0}
+SURGE_XT_ENABLED=${SWAPTUBE_ENABLE_SURGE_XT:-1}
 SURGE_XT_SOURCE_DIR=${SWAPTUBE_SURGE_XT_SOURCE_DIR:-"${REPO_ROOT}/.tmp/vendor/surge-xt"}
 # Check if MicroTeX build exists.
 # It is only needed by projects that render LaTeX, and LaTeX rendering can also
@@ -135,11 +135,24 @@ if [ -z "$PROJECT_PATH" ]; then
     exit 1
 fi
 PROJECT_PATH=$(cd "$(dirname "$PROJECT_PATH")" && pwd)/$(basename "$PROJECT_PATH")
-TEMPFILE="$(pwd)/src/Projects/.active_project.$$.$(date +%s).cpp"
-cp "$PROJECT_PATH" "$TEMPFILE"
+ACTIVE_PROJECT_FILE="$(pwd)/src/Projects/.active_project.cpp"
+ACTIVE_PROJECT_BACKUP=""
+
+if [ -f "$ACTIVE_PROJECT_FILE" ]; then
+    ACTIVE_PROJECT_BACKUP=$(mktemp "${TMPDIR:-/tmp}/swaptube-active-project.XXXXXX.cpp")
+    cp "$ACTIVE_PROJECT_FILE" "$ACTIVE_PROJECT_BACKUP"
+fi
+
+# Clean up legacy per-run temp files so stale build state cannot target an old source path.
+find src/Projects -maxdepth 1 -type f -name '.active_project.*.cpp' -delete
+
+cp "$PROJECT_PATH" "$ACTIVE_PROJECT_FILE"
 
 cleanup() {
-    rm -f "$TEMPFILE"
+    rm -f "$ACTIVE_PROJECT_FILE"
+    if [ -n "$ACTIVE_PROJECT_BACKUP" ] && [ -f "$ACTIVE_PROJECT_BACKUP" ]; then
+        mv "$ACTIVE_PROJECT_BACKUP" "$ACTIVE_PROJECT_FILE"
+    fi
 }
 
 trap cleanup EXIT
@@ -184,12 +197,12 @@ echo "go.sh: Building project ${PROJECT_NAME} with output folder name ${OUTPUT_F
     # Pass the variables to CMake as options
     cmake -G "$CMAKE_GENERATOR" .. \
         -DPROJECT_NAME_MACRO="${PROJECT_NAME}" \
-        -DPROJECT_SOURCE_FILE="${TEMPFILE}" \
+        -DPROJECT_SOURCE_FILE:FILEPATH="${ACTIVE_PROJECT_FILE}" \
         -DAUDIO_HINTS="${AUDIO_HINTS}" \
         -DAUDIO_SFX="${AUDIO_SFX}" \
         -DUSE_HIP="${USE_HIP}" \
         -DSWAPTUBE_ENABLE_SURGE_XT="${SURGE_XT_ENABLED}" \
-        -DSURGE_XT_SOURCE_DIR="${SURGE_XT_SOURCE_DIR}"
+        -DSURGE_XT_SOURCE_DIR:PATH="${SURGE_XT_SOURCE_DIR}"
 
     echo "go.sh: Compiling..."
     # build the project

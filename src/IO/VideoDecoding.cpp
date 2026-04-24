@@ -12,6 +12,17 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+namespace {
+
+bool has_file_extension(const std::string& filename) {
+    const size_t slash_position = filename.find_last_of("/\\");
+    const size_t dot_position = filename.find_last_of('.');
+    return dot_position != std::string::npos &&
+           (slash_position == std::string::npos || dot_position > slash_position);
+}
+
+} // namespace
+
 MP4FrameReader::MP4FrameReader(const std::string &vn)
     : video_name(vn), fmtCtx(nullptr), codecCtx(nullptr), swsCtx(nullptr),
       packet(nullptr), frame(nullptr), frameRGBA(nullptr),
@@ -94,7 +105,7 @@ bool MP4FrameReader::get_frame(int frame_index, int target_width, int target_hei
 
 void MP4FrameReader::open_file() {
     std::string filename = video_name;
-    if (filename.length() < 4 || filename.substr(filename.length() - 4) != ".mp4")
+    if (!has_file_extension(filename))
         filename += ".mp4";
     filename = "io_in/" + filename;
 

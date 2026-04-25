@@ -9,18 +9,57 @@
 #include "VideoWriter.h"
 #include "../Core/Smoketest.h"
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 
 using namespace std;
 
 namespace {
 
-bool transparent_mov_enabled() {
-    const char* value = std::getenv("SWAPTUBE_TRANSPARENT_MOV");
-    return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+string lowercase(string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
 }
 
-string video_output_path() {
-    return transparent_mov_enabled() ? "io_out/Video.mov" : "io_out/Video.mkv";
+bool env_flag_enabled(const char* name) {
+    const char* raw_value = std::getenv(name);
+    if (raw_value == nullptr || raw_value[0] == '\0') return false;
+
+    const string value = lowercase(raw_value);
+    return value != "0" &&
+           value != "off" &&
+           value != "false" &&
+           value != "no" &&
+           value != "disabled";
+}
+
+bool transparent_output_enabled() {
+    return env_flag_enabled("SWAPTUBE_TRANSPARENT") || env_flag_enabled("SWAPTUBE_TRANSPARENT_MOV");
+}
+
+string configured_video_format(const bool transparent_output) {
+    const char* value = std::getenv("SWAPTUBE_VIDEO_FORMAT");
+    string format = value != nullptr && value[0] != '\0' ? lowercase(value) : "";
+
+    if (format.empty()) {
+        format = transparent_output ? "mov" : "mkv";
+    }
+
+    if (format != "mp4" && format != "mov" && format != "mkv") {
+        throw runtime_error("Invalid SWAPTUBE_VIDEO_FORMAT: " + format + ". Use mp4, mov, or mkv.");
+    }
+
+    if (transparent_output && format != "mov") {
+        throw runtime_error("Transparent output currently requires MOV. Use --transparent --format=mov.");
+    }
+
+    return format;
+}
+
+string video_output_path(const string& format) {
+    return "io_out/Video." + format;
 }
 
 }
@@ -36,7 +75,9 @@ Writer::Writer(int video_width_pixels, int video_height_pixels, int video_framer
     subtitle = new SubtitleWriter();
 
     if (is_smoketest()) return;
-    const std::string video_path = video_output_path();
+    const bool transparent_output = transparent_output_enabled();
+    const string video_format = configured_video_format(transparent_output);
+    const string video_path = video_output_path(video_format);
     int ret = avformat_alloc_output_context2(&format_context, NULL, NULL, video_path.c_str());
     if (ret < 0) throw std::runtime_error("Failed to allocate output format context");
     if (format_context == nullptr) throw std::runtime_error("Failed to allocate output format context");
@@ -48,7 +89,7 @@ Writer::Writer(int video_width_pixels, int video_height_pixels, int video_framer
         video_width_pixels,
         video_height_pixels,
         video_framerate_fps,
-        transparent_mov_enabled()
+        transparent_output
     );
 }
 

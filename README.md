@@ -47,22 +47,27 @@ brew install cmake ffmpeg glib cairo librsvg libpng gnuplot nlohmann-json
 | LibPNG | PNG scenes | visual_media.cpp | Reads PNG files and converts them to pixel data | `sudo apt install libpng-dev` |
 | nlohmann/json | Reading and writing json files in I/O | Connect 4 data structures, GraphScene | GraphScene can write graphs to disk in json, Connect 4 steady states and compute caches are read from json | `sudo apt install nlohmann-json3-dev` |
 
-### Optional: Surge XT
-Swaptube can optionally embed the headless `surge-common` synth engine so projects can load finished presets and modulate them from scene state in C++.
+### Surge XT
+Swaptube embeds the headless `surge-common` synth engine by default so projects can load finished presets and modulate them from scene state in C++.
 
 The supported setup flow is:
 
 ```bash
 ./scripts/setup_surge_xt.sh
-SWAPTUBE_ENABLE_SURGE_XT=1 ./go.sh SurgeXTDemo 160 90 30 -s
+./go.sh SurgeXTDemo 160 90 30 -s
 ```
 
 By default the setup script installs a patched Surge XT checkout into `.tmp/vendor/surge-xt`. You can point Swaptube at another checkout with:
 
 ```bash
-SWAPTUBE_ENABLE_SURGE_XT=1 \
 SWAPTUBE_SURGE_XT_SOURCE_DIR=/abs/path/to/surge \
 ./go.sh SurgeXTDemo 160 90 30 -s
+```
+
+For quick non-Surge checks, disable it per command:
+
+```bash
+./go.sh GeneratedBlockDemo 160 90 30 -s --surgext=off
 ```
 
 Useful exploration env vars for `SurgeXTDemo`:
@@ -114,6 +119,17 @@ Some example code and demos can be found in `src/Projects/Demos/`. How to run a 
 ```
 
 This indicates a 640x360 landscape resolution at 30FPS. Swaptube defaults to an audio sample rate of 48000 Hz- If you need to change that for whatever reason, they are specified in `go.sh` and `record_audios.py`.
+
+Useful render flags:
+
+```bash
+./go.sh LoopingLambdaDemo 640 360 30 --format=mp4
+./go.sh LoopingLambdaDemo 640 360 30 --transparent
+./go.sh LoopingLambdaDemo 640 360 30 --test
+./go.sh LoopingLambdaDemo 640 360 30 --surgext=off
+```
+
+`--format` accepts `mp4`, `mov`, or `mkv`. `--transparent` preserves alpha and defaults to MOV output. `--test` runs through the render with a temporary output directory and deletes those files when the command exits. `--surgext` accepts `on` or `off` and defaults to `on`.
 
 # Testing
 You can validate your local installation with ./test.sh, which will compile and smoketest every "Demo" project (in `src/Projects/Demos/`) without rendering.

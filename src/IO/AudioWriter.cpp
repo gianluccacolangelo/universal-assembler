@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
 #include "Writer.h"
 #include "IoHelpers.h"
 #include "../Core/Smoketest.h"
@@ -20,6 +21,7 @@ extern "C"
     #include <libavcodec/avcodec.h>
     #include <libavformat/avformat.h>
     #include <libavutil/channel_layout.h>
+    #include <libavutil/samplefmt.h>
 }
 
 #if LIBAVUTIL_VERSION_MAJOR >= 57
@@ -36,9 +38,95 @@ using namespace std;
 // ffmpeg -h encoder=pcm_s16le # List all supported sample formats for a given encoder
 // ffmpeg -encoders | grep pcm # List all relevant wav encoders
 
-// signed integer, non-planar (interleaved)
-const AVCodecID output_codec = AV_CODEC_ID_PCM_S32LE;
-const AVSampleFormat output_sample_format = AV_SAMPLE_FMT_S32;
+namespace {
+
+// Recorded voice assets are expected to remain raw signed 32-bit PCM.
+const AVCodecID input_audio_codec = AV_CODEC_ID_PCM_S32LE;
+const AVSampleFormat input_audio_sample_format = AV_SAMPLE_FMT_S32;
+
+bool output_container_is_mp4(const AVFormatContext* fc) {
+    if (!fc || !fc->oformat || !fc->oformat->name) return false;
+    const string format_name = fc->oformat->name;
+    return format_name.find("mp4") != string::npos;
+}
+
+AVCodecID output_audio_codec_for_container(const AVFormatContext* fc) {
+    return output_container_is_mp4(fc) ? AV_CODEC_ID_AAC : AV_CODEC_ID_PCM_S32LE;
+}
+
+AVSampleFormat preferred_output_sample_format(const AVCodecID codec_id) {
+    return codec_id == AV_CODEC_ID_AAC ? AV_SAMPLE_FMT_FLTP : AV_SAMPLE_FMT_S32;
+}
+
+AVSampleFormat choose_output_sample_format(const AVCodec* codec, const AVSampleFormat preferred) {
+    if (!codec || !codec->sample_fmts) return preferred;
+
+    for (const AVSampleFormat* sample_format = codec->sample_fmts;
+         *sample_format != AV_SAMPLE_FMT_NONE;
+         ++sample_format) {
+        if (*sample_format == preferred) return preferred;
+    }
+
+    return codec->sample_fmts[0];
+}
+
+int16_t sample_to_s16(const sample_t sample) {
+    const float normalized = std::clamp(sample_to_float(sample), -1.0f, 1.0f);
+    return static_cast<int16_t>(std::round(normalized * 32767.0f));
+}
+
+void write_stereo_sample(
+    AVFrame* frame,
+    const AVCodecContext* codec_context,
+    const int sample_index,
+    const sample_t left,
+    const sample_t right
+) {
+    switch (codec_context->sample_fmt) {
+        case AV_SAMPLE_FMT_S32: {
+            sample_t* dst = reinterpret_cast<sample_t*>(frame->data[0]);
+            dst[2 * sample_index] = left;
+            dst[2 * sample_index + 1] = right;
+            return;
+        }
+        case AV_SAMPLE_FMT_S32P: {
+            reinterpret_cast<sample_t*>(frame->data[0])[sample_index] = left;
+            reinterpret_cast<sample_t*>(frame->data[1])[sample_index] = right;
+            return;
+        }
+        case AV_SAMPLE_FMT_FLT: {
+            float* dst = reinterpret_cast<float*>(frame->data[0]);
+            dst[2 * sample_index] = sample_to_float(left);
+            dst[2 * sample_index + 1] = sample_to_float(right);
+            return;
+        }
+        case AV_SAMPLE_FMT_FLTP: {
+            reinterpret_cast<float*>(frame->data[0])[sample_index] = sample_to_float(left);
+            reinterpret_cast<float*>(frame->data[1])[sample_index] = sample_to_float(right);
+            return;
+        }
+        case AV_SAMPLE_FMT_S16: {
+            int16_t* dst = reinterpret_cast<int16_t*>(frame->data[0]);
+            dst[2 * sample_index] = sample_to_s16(left);
+            dst[2 * sample_index + 1] = sample_to_s16(right);
+            return;
+        }
+        case AV_SAMPLE_FMT_S16P: {
+            reinterpret_cast<int16_t*>(frame->data[0])[sample_index] = sample_to_s16(left);
+            reinterpret_cast<int16_t*>(frame->data[1])[sample_index] = sample_to_s16(right);
+            return;
+        }
+        default: {
+            const char* sample_format_name = av_get_sample_fmt_name(codec_context->sample_fmt);
+            throw runtime_error(
+                "Unsupported output audio sample format: " +
+                string(sample_format_name ? sample_format_name : "unknown")
+            );
+        }
+    }
+}
+
+}
 
 AudioWriter::AudioWriter(AVFormatContext *fc_, int audio_samplerate_hz_, int video_framerate_fps_) :
     outputCodecContexts(std::vector<AVCodecContext*>(num_audio_streams, nullptr)),
@@ -50,8 +138,9 @@ AudioWriter::AudioWriter(AVFormatContext *fc_, int audio_samplerate_hz_, int vid
     current_macroblock_length_samples(0), current_microblock_length_samples(0), macroblock_linear_step(0), microblock_linear_step(0),
     macroblock_line(0), microblock_line(0)
 {
+    const AVCodecID output_audio_codec = output_audio_codec_for_container(fc_);
     for(int i = 0; i < num_audio_streams; i++) {
-        const AVCodec* audioOutputCodec = avcodec_find_encoder(output_codec);
+        const AVCodec* audioOutputCodec = avcodec_find_encoder(output_audio_codec);
 
         if (!audioOutputCodec) throw runtime_error("Error: Could not find audio encoder for codec.");
 
@@ -65,8 +154,17 @@ AudioWriter::AudioWriter(AVFormatContext *fc_, int audio_samplerate_hz_, int vid
         outputCodecContexts[i]->channel_layout = AV_CH_LAYOUT_STEREO;
         outputCodecContexts[i]->channels = audio_channels;
 #endif
-        outputCodecContexts[i]->sample_fmt = output_sample_format;
+        outputCodecContexts[i]->sample_fmt = choose_output_sample_format(
+            audioOutputCodec,
+            preferred_output_sample_format(output_audio_codec)
+        );
         outputCodecContexts[i]->time_base = {1, outputCodecContexts[i]->sample_rate};
+        if (output_audio_codec == AV_CODEC_ID_AAC) {
+            outputCodecContexts[i]->bit_rate = 192000;
+        }
+        if (fc_ && fc_->oformat && (fc_->oformat->flags & AVFMT_GLOBALHEADER)) {
+            outputCodecContexts[i]->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
 
         int ret = avcodec_open2(outputCodecContexts[i], audioOutputCodec, nullptr);
         if (ret < 0) {
@@ -250,11 +348,11 @@ int AudioWriter::add_audio_from_file(const string& filename) {
         throw runtime_error("Error: No audio stream found in file: " + fullInputAudioFilename);
     }
 
-    if (audioStreamInput->codecpar->codec_id != output_codec) {
+    if (audioStreamInput->codecpar->codec_id != input_audio_codec) {
         throw runtime_error("Error: Input file is not in expected format: " + fullInputAudioFilename);
     }
 
-    if (audioStreamInput->codecpar->format != output_sample_format) {
+    if (audioStreamInput->codecpar->format != input_audio_sample_format) {
         throw runtime_error("Error: Input file is not in expected sample format: " + fullInputAudioFilename);
     }
 
@@ -281,7 +379,7 @@ int AudioWriter::add_audio_from_file(const string& filename) {
     }
 
     // Set up the audio decoder
-    const AVCodec* audioDecoder = avcodec_find_decoder(output_codec);
+    const AVCodec* audioDecoder = avcodec_find_decoder(input_audio_codec);
     if (!audioDecoder) {
         throw runtime_error("Error: appropriate audio decoder not found.");
     }
@@ -402,11 +500,6 @@ void AudioWriter::encode_buffers() {
             setupFrame(frames[i], outputCodecContexts[i]);
         }
 
-        vector<sample_t*> dst = vector<sample_t*>(num_audio_streams, nullptr);
-        for(int i = 0; i < num_audio_streams; i++) {
-            dst[i] = reinterpret_cast<sample_t*>(frames[i]->data[0]);
-        }
-
         for (int i = 0; i < frameSize; ++i) {
             int idxL = 2 * i;
             int idxR = 2 * i + 1;
@@ -422,19 +515,22 @@ void AudioWriter::encode_buffers() {
 
             if(AUDIO_SFX){
                 // Voice-only track
-                dst[track_number][idxL] = voice_left;
-                dst[track_number][idxR] = voice_right;
+                write_stereo_sample(frames[track_number], outputCodecContexts[track_number], i, voice_left, voice_right);
                 track_number++;
 
                 // Sfx-only track
-                dst[track_number][idxL] = sfx_left;
-                dst[track_number][idxR] = sfx_right;
+                write_stereo_sample(frames[track_number], outputCodecContexts[track_number], i, sfx_left, sfx_right);
                 track_number++;
             }
 
             // Merged audio track
-            dst[track_number][idxL] = voice_left + sfx_left;
-            dst[track_number][idxR] = voice_right+ sfx_right;
+            write_stereo_sample(
+                frames[track_number],
+                outputCodecContexts[track_number],
+                i,
+                voice_left + sfx_left,
+                voice_right + sfx_right
+            );
             track_number++;
 
             {
@@ -450,8 +546,7 @@ void AudioWriter::encode_buffers() {
 
             if(AUDIO_HINTS){
                 // Blips-only track
-                dst[track_number][idxL] = blips_left;
-                dst[track_number][idxR] = blips_right;
+                write_stereo_sample(frames[track_number], outputCodecContexts[track_number], i, blips_left, blips_right);
                 track_number++;
 
                 if(blips_left != 0){ // All microblocks are same length, so only reset on macroblock
@@ -464,8 +559,13 @@ void AudioWriter::encode_buffers() {
                 }
 
                 // Transition Lines
-                dst[track_number][idxL] = macroblock_line;
-                dst[track_number][idxR] = microblock_line;
+                write_stereo_sample(
+                    frames[track_number],
+                    outputCodecContexts[track_number],
+                    i,
+                    static_cast<sample_t>(macroblock_line),
+                    static_cast<sample_t>(microblock_line)
+                );
                 track_number++;
 
                 macroblock_line += macroblock_linear_step;
